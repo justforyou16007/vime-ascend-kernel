@@ -291,12 +291,12 @@ def test_start_weight_update_posts_four_phase_endpoint(vllm_engine, monkeypatch)
 
     monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
 
-    result = vllm_engine.start_weight_update(is_checkpoint_format=True)
+    result = vllm_engine.start_weight_update()
 
     assert result == {"ok": True}
     assert len(calls) == 1
     assert calls[0][0] == "start_weight_update"
-    assert calls[0][1] == {"is_checkpoint_format": True}
+    assert calls[0][1] == {}
 
 
 @pytest.mark.unit
@@ -334,15 +334,16 @@ def test_update_weights_from_tensor_posts_ipc_payload_and_records_version(vllm_e
         weight_version="42",
     )
 
-    assert posted[0][0] == "collective_rpc"
-    assert posted[0][1]["method"] == "update_weights_chunk"
-    sent = posted[0][1]["kwargs"]["update_info"]
+    assert posted[0][0] == "update_weights"
+    sent = posted[0][1]["update_info"]
     # ipc_handles got cloudpickle'd into ipc_handles_pickled
     assert "ipc_handles" not in sent
     assert isinstance(sent["ipc_handles_pickled"], str)
     assert sent["names"] == ["layer.0.weight"]
     assert sent["shapes"] == [[2, 2]]
-    # version recorded after POST success
+    assert vllm_engine._weight_version is None
+    vllm_engine.finish_weight_update()
+    assert posted[-1] == ("finish_weight_update", {"weight_version": "42"})
     assert vllm_engine._weight_version == "42"
 
 
@@ -562,6 +563,70 @@ def test_resume_memory_occupation_posts_wake_even_when_sleep_disabled(vllm_engin
 
     assert vllm_engine.resume_memory_occupation() == {"ok": True, "sleep_mode": True}
     assert seen == [("http://127.0.0.1:8765/wake_up", None, 30, None)]
+
+
+@pytest.mark.parametrize("fail_kv_wake", [False, True])
+def test_generation_waits_for_kv_wake(vllm_engine, monkeypatch, fail_kv_wake):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url.rsplit("/", 1)[-1])
+        failed = fail_kv_wake and kwargs.get("params") == [("tags", "kv_cache")]
+        return _MockResponse(json_data={"ok": not failed}, status_code=500 if failed else 200)
+
+    monkeypatch.setattr(mod.requests, "post", post)
+    vllm_engine.resume_memory_occupation(tags=["weights"])
+    vllm_engine.continue_generation()
+    assert calls == ["wake_up"]
+    if fail_kv_wake:
+        with pytest.raises(requests.HTTPError):
+            vllm_engine.resume_memory_occupation(tags=["kv_cache"])
+        assert calls == ["wake_up", "wake_up"]
+        assert vllm_engine._resume_pending
+    else:
+        vllm_engine.resume_memory_occupation(tags=["kv_cache"])
+        assert calls == ["wake_up", "wake_up", "resume"]
+        assert not vllm_engine._resume_pending
+
+
+def test_generation_without_partial_wake_resumes_immediately(vllm_engine, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mod.requests, "post", lambda url, **kw: calls.append(url) or _MockResponse())
+    vllm_engine.continue_generation()
+    assert calls == ["http://127.0.0.1:8765/resume"]
+
+
+def test_colocated_launch_requires_reload_config(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.vllm_additional_config = {"rl_config": {"enable_sleep_mode_cleanup": False}, "custom": 1}
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    cmd, env = mod.build_vllm_cmd_and_env(server_args)
+    config = json.loads(cmd[cmd.index("--additional-config") + 1])
+    assert config == {"rl_config": {"enabled": True, "enable_sleep_mode_cleanup": False},
+                      "weight_nz_mode": 0, "custom": 1}
+    assert json.loads(cmd[cmd.index("--weight-transfer-config") + 1])["backend"] == "vime_npu_ipc"
+    assert cmd[cmd.index("--worker-extension-cls") + 1].endswith("npu_weight_transfer.VimeNPUWorkerExtension")
+    assert env["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
+
+
+@pytest.mark.parametrize("additional", [
+    {"rl_config": {"enabled": False}}, {"weight_nz_mode": 1}, {"multistream_overlap_shared_expert": True},
+])
+def test_colocated_launch_rejects_incompatible_options(vllm_args, additional):
+    vllm_args.colocate = True
+    vllm_args.vllm_additional_config = additional
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    with pytest.raises(ValueError, match="vime_npu_ipc"):
+        mod.build_vllm_cmd_and_env(server_args)
+
+
+def test_colocated_launch_rejects_native_ipc_without_reload(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.vllm_weight_transfer_config = {"backend": "npu_ipc"}
+    vllm_args._vllm_user_provided = {"vllm_weight_transfer_config"}
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    with pytest.raises(ValueError, match="vime_npu_ipc"):
+        mod.build_vllm_cmd_and_env(server_args)
 
 
 @pytest.mark.unit
@@ -815,3 +880,14 @@ def test_build_vllm_cmd_no_dp_flags_when_off(vllm_args):
     server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
     cmd, _ = mod.build_vllm_cmd_and_env(server_args)
     assert not any(isinstance(c, str) and c.startswith("--data-parallel-") for c in cmd)
+
+
+def test_finish_failure_keeps_committed_version(vllm_engine, monkeypatch):
+    vllm_engine._weight_version = "old"
+    vllm_engine._pending_weight_version = "new"
+    def fail(*args):
+        raise RuntimeError("worker rejected incomplete reload")
+    monkeypatch.setattr(vllm_engine, "_make_request", fail)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        vllm_engine.finish_weight_update()
+    assert vllm_engine._weight_version == "old"

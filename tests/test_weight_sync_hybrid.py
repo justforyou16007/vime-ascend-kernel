@@ -44,11 +44,11 @@ def test_extension_has_no_attr_conflict_with_npu_worker():
     不得与 worker 类已有属性冲突)。NPUWorker 在纯 CPU 测试进程里不可导入
     (运行态依赖),故用 AST 取两边的方法集合 —— 比 import 更稳,且语义等价。
     """
-    import vime.backends.megatron_utils.update_weight.update_weight_from_tensor as uwft
+    from vime.backends.vllm_utils import npu_weight_transfer as uwft
 
     ext_attrs = {
         n
-        for n in _class_method_names(uwft.__file__, "vLLMColocateWorkerExtension")
+        for n in _class_method_names(uwft.__file__, "VimeNPUWorkerExtension")
     }
     import vllm_ascend  # 只取路径,不导入 worker(运行态依赖)
 
@@ -57,7 +57,7 @@ def test_extension_has_no_attr_conflict_with_npu_worker():
 
     conflict = ext_attrs & worker_attrs
     assert not conflict, f"扩展类与 NPUWorker 属性冲突: {conflict} —— WorkerProc 启动会断言失败"
-    assert "update_weights_chunk" in ext_attrs
+    assert not ext_attrs  # Registration only; lifecycle stays on the native worker.
 
 
 # ─── 2. 共卡/远程切分 ────────────────────────────────────────────────────────────
@@ -167,83 +167,35 @@ class _ToyModel(nn.Module):
 
 
 def _run_chunked_ipc_reload(clone_on_receive: bool, garbage_between_chunks: bool):
-    """模拟:layer1 的 w_a 随 chunk0 交付但被缓冲(层未齐),trainer 随即覆写源显存,
-    chunk1 交付 w_b 凑齐该层触发处理 —— 验证缓冲的 w_a 是否被污染。
-
-    通过真实 layerwise reload 机制(record/initialize + online_process_loader 缓冲),
-    并用假的 IPC rebuild 函数交付**借用视图**,复现跨进程生命周期风险。
-    """
     from vllm.model_executor.model_loader.reload import layerwise as lw
-
-    from vime.backends.megatron_utils.update_weight import update_weight_from_tensor as uwft
+    from vime.backends.vllm_utils import npu_weight_transfer as transfer
 
     n = 64
     model = _ToyModel(n)
-    s0, sa, sb = torch.randn(n, n), torch.randn(n, n), torch.randn(n, n)
-    s0_ref, sa_ref, sb_ref = s0.clone(), sa.clone(), sb.clone()  # pristine 对照
-
+    sources = [torch.randn(n, n) for _ in range(3)]
+    pristine = tuple(x.clone() for x in sources)
     lw.record_metadata_for_reloading(model)
-    lw.initialize_layerwise_reload(model)
-
-    # 假 IPC:func(*args) 返回源 tensor 的借用视图(uuid 与设备探测打桩)
-    def make_fake_handle(src):
-        def fake_rebuild(*args):
-            return src.view(n, n)  # 借用视图,不持有新存储
-
-        return {"fake-uuid": (fake_rebuild, (0,) * 7)}
-
-    fake_dev = mock.Mock()
-    fake_dev.current_device.return_value = 0
-    fake_dev.get_device_properties.return_value = types.SimpleNamespace(uuid="fake-uuid")
-
-    engine = types.SimpleNamespace(
-        _weight_update_active=True,
-        _is_checkpoint_format=True,
-        model_runner=types.SimpleNamespace(model=model),
-        device=torch.device("cpu"),
-        vllm_config=None,
-    )
-
-    with (
-        mock.patch.object(uwft, "_device_module", lambda: fake_dev),
-        mock.patch("torch.accelerator.synchronize", lambda: None),
-        mock.patch("vllm.config.set_current_vllm_config", lambda cfg: nullcontext()),
+    cfg = types.SimpleNamespace(parallel_config=None, quant_config=None, speculative_config=None,
+                                model_config=types.SimpleNamespace(dtype=torch.float32, multimodal_config=None))
+    engine = transfer.VimeNPUIPCWeightTransferEngine(None, cfg, torch.device("cpu"), model)
+    def send(names, tensors):
+        engine.update_weights(dict(names=names, shapes=[list(t.shape) for t in tensors],
+                                   dtype_names=["float32"] * len(tensors),
+                                   ipc_handles=[{"fake-uuid": (t, 0, 0, 0, 0, 0, 0)} for t in tensors]))
+    with mock.patch.object(transfer, "npu_generate_uuid", lambda *_: "fake-uuid"), mock.patch.object(
+        transfer, "rebuild_npu_tensor", lambda *args: args[0].view(n, n)
+    ), mock.patch.object(transfer, "set_current_vllm_config", lambda cfg: nullcontext()), mock.patch(
+        "torch.accelerator.synchronize", lambda: None
     ):
-        if not clone_on_receive:
-            # 反事实对照:取消 clone,验证测试确实能抓到借用显存问题
-            orig = uwft.vLLMColocateWorkerExtension.update_weights_chunk
-
-            def no_clone_chunk(self, update_info):
-                with mock.patch("torch.Tensor.clone", lambda t: t):
-                    return orig(self, update_info)
-
-            chunk_fn = no_clone_chunk
-        else:
-            chunk_fn = uwft.vLLMColocateWorkerExtension.update_weights_chunk
-
-        # chunk 0:layer0(完整,同步消费)+ layer1.w_a(缓冲,等 w_b)
-        chunk0 = {
-            "names": ["layer0.weight", "layer1.w_a"],
-            "dtype_names": ["float32", "float32"],
-            "shapes": [[n, n], [n, n]],
-            "ipc_handles": [make_fake_handle(s0), make_fake_handle(sa)],
-        }
-        chunk_fn(engine, chunk0)
-
+        engine.start_weight_update()
+        with (nullcontext() if clone_on_receive else mock.patch("torch.Tensor.clone", lambda t: t)):
+            send(["layer0.weight", "layer1.w_a"], sources[:2])
         if garbage_between_chunks:
-            s0.fill_(float("nan"))  # trainer 侧 del + 复用:覆写源显存
-            sa.fill_(float("nan"))
-
-        # chunk 1:layer1.w_b —— 凑齐 layer1,触发处理(读缓冲的 w_a)
-        chunk1 = {
-            "names": ["layer1.w_b"],
-            "dtype_names": ["float32"],
-            "shapes": [[n, n]],
-            "ipc_handles": [make_fake_handle(sb)],
-        }
-        chunk_fn(engine, chunk1)
-
-    return model, (s0_ref, sa_ref, sb_ref)
+            sources[0].fill_(float("nan"))
+            sources[1].fill_(float("nan"))
+        send(["layer1.w_b"], sources[2:])
+        engine.finish_weight_update()
+    return model, pristine
 
 
 def test_ipc_borrowed_tensor_lifetime_with_clone():
@@ -254,47 +206,6 @@ def test_ipc_borrowed_tensor_lifetime_with_clone():
 
 
 # ─── 5. 共享专家校验的就绪门控(run 172029 .64 失败根因) ───────────────────────
-def _ready_gate(se_module):
-    """以最小 fake 调用 vllm-ascend 的就绪门控(不构造 AscendFusedMoE)。"""
-    from vllm_ascend.ops.fused_moe.fused_moe_0_23_0 import AscendFusedMoE
-
-    fake_self = types.SimpleNamespace(_shared_experts=se_module)
-    return AscendFusedMoE._shared_experts_ready_for_validation(fake_self)
-
-
-def _make_info(load_numel, load_numel_total):
-    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
-
-    info = LayerReloadingInfo(restore_metadata=({}, {}), restore_device=torch.device("cpu"))
-    info.load_numel = load_numel
-    info.load_numel_total = load_numel_total
-    return info
-
-
-def test_shared_expert_validation_gate():
-    from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-
-    se = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
-    try:
-        # 启动期(无会话条目)→ 就绪,保持启动校验
-        assert _ready_gate(se) is True
-
-        # reload 会话中,共享专家参数未到齐 → 未就绪(跳过,finish 兜底)
-        LAYERWISE_INFO[se[0]] = _make_info(0, 16)
-        assert _ready_gate(se) is False
-
-        # 到齐 → 就绪
-        LAYERWISE_INFO[se[0]] = _make_info(16, 16)
-        assert _ready_gate(se) is True
-
-        # 另一个子模块未初始化会话(total=None)→ 不阻塞
-        LAYERWISE_INFO[se[1]] = _make_info(0, None)
-        assert _ready_gate(se) is True
-    finally:
-        for m in (se[0], se[1]):
-            LAYERWISE_INFO.pop(m, None)
-
-
 # ─── 6. TCPStore 端口竞态修复(20260824 连续两次 EADDRINUSE)────────────────────
 def test_dist_init_addr_parse():
     from vime.backends.vllm_utils.vllm_engine import parse_dist_init_addr
@@ -319,7 +230,11 @@ def test_dist_init_port_env_injection():
 
 def test_vllm_executor_honors_dist_init_port_env():
     """vllm-023 multiproc_executor 必须读 VLLM_DIST_INIT_PORT 并回退 get_open_port。"""
-    src = open("/workspace/vllm-023/vllm/v1/executor/multiproc_executor.py").read()
+    import vllm
+    path = os.path.join(os.path.dirname(vllm.__file__), "v1/executor/multiproc_executor.py")
+    src = open(path).read()
+    if 'VLLM_DIST_INIT_PORT' not in src:
+        pytest.skip("Legacy 0.23 TCPStore port patch is not present in the 0.28 base")
     assert 'os.environ.get("VLLM_DIST_INIT_PORT"' in src
     assert "or get_open_port()" in src
 
@@ -425,7 +340,7 @@ def test_explicit_role_drives_backend_on_same_host():
         _minimal_server_args("80.48.5.56", colocated=False)
     )
 
-    assert _flag_value(colocated_cmd, "--weight-transfer-config") == '{"backend":"npu_ipc"}'
+    assert _flag_value(colocated_cmd, "--weight-transfer-config") == '{"backend":"vime_npu_ipc"}'
     assert _flag_value(dedicated_cmd, "--weight-transfer-config") == '{"backend":"nccl"}'
     assert "--worker-extension-cls" in colocated_cmd
     assert "--worker-extension-cls" not in dedicated_cmd

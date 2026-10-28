@@ -48,7 +48,7 @@ def _begin_vllm_weight_update_session(rollout_engines: Sequence[ActorHandle]) ->
         #   [A,A](两个相同 handle)→ 列表有重复;[A,B](两个不同)→ 看 actor 侧 http_base 是否相同。
         logger.info("[WSYNC-DBG] _begin start dispatch n=%d handles=%r",
                     len(rollout_engines), [str(e) for e in rollout_engines])
-        ray.get([engine.start_weight_update.remote(is_checkpoint_format=True) for engine in rollout_engines])
+        ray.get([engine.start_weight_update.remote() for engine in rollout_engines])
     dist.barrier(group=get_gloo_group())
 
 

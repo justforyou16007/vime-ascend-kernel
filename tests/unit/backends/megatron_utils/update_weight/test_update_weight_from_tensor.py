@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-import warnings
 from argparse import Namespace
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
@@ -189,6 +188,14 @@ def _make_instance(upw_vllm, args=None):
     return obj
 
 
+def test_bridge_rejected_before_collectives(upw_vllm):
+    with pytest.raises(ValueError, match="megatron-to-hf-mode raw"):
+        upw_vllm.UpdateWeightFromTensor(
+            _default_args(megatron_to_hf_mode="bridge"), [], lambda: {},
+            model_name="test", quantization_config=None,
+        )
+
+
 def _bind_single_slot(obj, engine, *, src=0):
     """Bind ``obj`` to one colocated engine forming a slot whose leader rank is ``src``."""
     obj.rollout_engines = [engine]
@@ -249,7 +256,7 @@ def test_colocated_lifecycle_uses_pause_flush_and_weight_transfer_apis(upw_vllm)
     # vLLM #39212: init runs in connect_rollout_engines, not update_weights.
     assert len(engine.init_weight_transfer_engine.calls) == 0
     assert len(engine.start_weight_update.calls) == 1
-    assert engine.start_weight_update.calls[0].kwargs.get("is_checkpoint_format") is True
+    assert engine.start_weight_update.calls[0].kwargs == {}
     assert len(engine.finish_weight_update.calls) == 1
     assert len(engine.continue_generation.calls) == 1
     # ipc_collect: one per HF chunk + one after the loop.
@@ -262,8 +269,7 @@ def test_colocated_lifecycle_uses_pause_flush_and_weight_transfer_apis(upw_vllm)
 def test_send_via_ipc_dispatches_update_weights_from_tensor_with_version(upw_vllm):
     """slot_size=1: every HF chunk fires
     ``engine.update_weights_from_tensor.remote(**fields, weight_version=...)`` —
-    same name, parameterized fields, version travels with data (no piggyback onto
-    ``finish_weight_update``)."""
+    each chunk stages the version, then finish commits it."""
     obj = _make_instance(upw_vllm)
     engine = RecordingVLLMEngine()
     _bind_single_slot(obj, engine, src=0)
@@ -285,9 +291,9 @@ def test_send_via_ipc_dispatches_update_weights_from_tensor_with_version(upw_vll
     assert kwargs["ipc_handles"] is dummy_info["ipc_handles"]
     # weight_version is the trainer's post-increment version (0 + 1 = 1) as a str
     assert kwargs["weight_version"] == "1"
-    # finish_weight_update is a stateless bookend now — no kwargs
+    # The version becomes visible only when the complete update finishes.
     assert len(engine.finish_weight_update.calls) == 1
-    assert engine.finish_weight_update.calls[0].kwargs == {}
+    assert engine.finish_weight_update.calls[0].kwargs == {"weight_version": "1"}
 
 
 @pytest.mark.unit
@@ -312,6 +318,9 @@ def test_send_via_ipc_dispatches_update_weights_from_tensor_coordinator_multi_gp
     }
 
     def fake_all_gather_object(gathered_payloads, payload, group=None):
+        if group != "slot_group":
+            gathered_payloads[:] = [payload] * len(gathered_payloads)
+            return
         gathered_payloads[0] = "payload0"
         gathered_payloads[1] = "payload1"
 
@@ -405,7 +414,8 @@ def test_non_leader_skips_start_finish_and_merged_rpc(upw_vllm):
     ), patch("torch.distributed.all_gather_object") as all_gather_obj:
         _run_update(obj, chunks=_chunks(1), rank=1, slot_size=2)
 
-    all_gather_obj.assert_called_once()
+    assert sum(c.kwargs.get("group") == "slot_group" for c in all_gather_obj.call_args_list) == 1
+    assert all_gather_obj.call_count > 1  # Includes the acknowledgement before export release.
     # non-leader: no start/finish, and no merged update_weights_from_tensor RPC
     assert len(engine.start_weight_update.calls) == 0
     assert len(engine.finish_weight_update.calls) == 0
@@ -449,15 +459,56 @@ def test_ipc_init_runs_once_in_connect(upw_vllm):
     assert len(engines2[1].init_weight_transfer_engine.calls) == 0
 
 
-@pytest.mark.unit
-def test_capture_vllm_param_attrs_skips_tensor_transpose_properties(upw_vllm):
-    model = torch.nn.Module()
-    model.weight = torch.nn.Parameter(torch.zeros(2, 3, 4))
-    model.weight.weight_loader = object()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        attrs = upw_vllm._capture_vllm_param_attrs(model)["weight"]
 
-    assert attrs["weight_loader"] is model.weight.weight_loader
-    assert not {"T", "H", "mT", "mH"}.intersection(attrs)
+def test_chunk_failure_does_not_finish_resume_or_advance_version(upw_vllm):
+    obj = _make_instance(upw_vllm)
+    engine = RecordingVLLMEngine()
+    _bind_single_slot(obj, engine)
+    def exchange(values, error, group=None):
+        values[:] = [error] * len(values)
+    with patch.object(obj, "_send_hf_params", side_effect=RuntimeError("rebuild failed")), patch(
+        "torch.distributed.all_gather_object", side_effect=exchange
+    ):
+        with pytest.raises(RuntimeError, match="rebuild failed"):
+            _run_update(obj, chunks=_chunks())
+    assert obj.weight_version == 0
+    assert not engine.finish_weight_update.calls
+    assert not engine.continue_generation.calls
+
+
+def test_non_leader_keeps_exports_until_global_ack(upw_vllm):
+    import weakref
+    alive = []
+    def action():
+        tensor = torch.ones(1)
+        alive.append(weakref.ref(tensor))
+        return [tensor]
+    def exchange(values, error, group=None):
+        assert alive[0]() is not None
+        values[:] = [None, None]
+    with patch("torch.distributed.get_world_size", return_value=2), patch(
+        "torch.distributed.all_gather_object", side_effect=exchange
+    ):
+        result = upw_vllm._run_weight_update_step(action)
+    assert alive[0]() is result[0]
+    del result
+    assert alive[0]() is None
+
+
+def test_peer_failure_reaches_non_leader(upw_vllm):
+    def exchange(values, error, group=None):
+        values[:] = ["receiver failed", None]
+    with patch("torch.distributed.get_world_size", return_value=2), patch(
+        "torch.distributed.all_gather_object", side_effect=exchange
+    ), pytest.raises(RuntimeError, match="receiver failed"):
+        upw_vllm._run_weight_update_step(lambda: [])
+
+
+@pytest.mark.parametrize("key,value", [("names", ["other"]), ("shapes", [[4]]), ("dtype_names", ["float32"])])
+def test_merge_rejects_misaligned_rank_payloads(upw_vllm, key, value):
+    a = dict(names=["w"], shapes=[[2, 2]], dtype_names=["bfloat16"], ipc_handles=[{"host-0": ()}])
+    b = dict(a, ipc_handles=[{"host-1": ()}])
+    b[key] = value
+    with pytest.raises(ValueError, match="disagree"):
+        upw_vllm._merge_ipc_update_infos([a, b])

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
@@ -563,19 +564,7 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     if not _user_overrode(args, "vllm_logprobs_mode"):
         cmd += ["--logprobs-mode", "processed_logprobs"]
 
-    # 3) weight_transfer_config: vllm default None disables /init_weight_transfer_engine,
-    #    so vime's weight sync would fail.
-    #    - Colocated mode: use IPC backend. UpdateWeightFromTensor calls
-    #      IPCWeightTransferEngine.trainer_send_weights and passes an empty init_info
-    #      dict, which is the correct signature for the IPC backend.
-    #    - Non-colocated mode: use NCCL backend. Weight sync goes through
-    #      update_weights_from_distributed; the vLLM engine still needs
-    #      init_weight_transfer_engine to succeed (with NCCL the caller must supply
-    #      master_address, master_port, rank_offset, and world_size separately).
-    #    - Hybrid (share) layouts use resolve_engine_roles. Colocated engines
-    #      use IPC; dedicated engines use NCCL/HCCL even when they are on the
-    #      actor's host.
-    #    Users who pass ``--vllm-weight-transfer-config`` explicitly are honored.
+    # Each colocated engine uses the checkpoint-format NPU IPC backend.
     _colocated_engine = server_args.get("colocated")
     if _colocated_engine is None:
         _colocated_engine = getattr(args, "colocate", False)
@@ -592,11 +581,7 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
             _serialize_weight_transfer_config(args.vllm_weight_transfer_config),
         ]
     elif _colocated_engine:
-        # npu_ipc 而非 ipc:vllm-ascend 注册的 NPU 原生 IPC 引擎(torch_npu 的
-        # _share_npu_/rebuild_npu_tensor);vllm core 的 "ipc" 是 CUDA 语义。
-        # vime 的 update_weights_chunk 实际绕过 transfer engine,这里主要是构造期
-        # 与生命周期空操作不出错。
-        cmd += ["--weight-transfer-config", '{"backend":"npu_ipc"}']
+        cmd += ["--weight-transfer-config", '{"backend":"vime_npu_ipc"}']
     else:
         cmd += ["--weight-transfer-config", '{"backend":"nccl"}']
 
@@ -606,7 +591,7 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     if _colocated_engine and "--worker-extension-cls" not in cmd:
         cmd += [
             "--worker-extension-cls",
-            "vime.backends.megatron_utils.update_weight.update_weight_from_tensor.vLLMColocateWorkerExtension",
+            "vime.backends.vllm_utils.npu_weight_transfer.VimeNPUWorkerExtension",
         ]
 
     if worker_type in ("prefill", "decode") and topology.node_rank == 0:
@@ -642,6 +627,19 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     _per_group = server_args.get("additional_config") or {}
     _merged_additional = dict(_global_dict)
     _merged_additional.update(_per_group)
+    transfer_config = json.loads(cmd[cmd.index("--weight-transfer-config") + 1])
+    if _colocated_engine:
+        if transfer_config.get("backend") != "vime_npu_ipc":
+            raise ValueError("Colocated vLLM 0.28 requires the vime_npu_ipc reload backend")
+        rl_config = dict(_merged_additional.get("rl_config") or {})
+        if rl_config.get("enabled", True) is not True or _merged_additional.get("weight_nz_mode", 0) != 0:
+            raise ValueError("vime_npu_ipc requires rl_config.enabled=true and weight_nz_mode=0")
+        if _merged_additional.get("multistream_overlap_shared_expert", False):
+            raise ValueError("Validate shared-expert overlap separately before enabling it with vime_npu_ipc")
+        rl_config["enabled"] = True
+        _merged_additional["rl_config"] = rl_config
+        _merged_additional["weight_nz_mode"] = 0
+        env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     if _merged_additional and "--additional-config" not in cmd:
         import json as _json
 
@@ -768,6 +766,9 @@ class VLLMEngine(RayActor):
         self.num_gpus_per_engine = num_gpus_per_engine
         self.process: multiprocessing.Process | None = None
         self._weight_version: str | None = None
+        self._pending_weight_version: str | None = None
+        self._awaiting_kv_wake = False
+        self._resume_pending = False
         self.node_rank = 0
         self._topology: VllmEngineTopology | None = None
         self._server_args: dict | None = None
@@ -979,8 +980,8 @@ class VLLMEngine(RayActor):
         flush_cache: bool = False,
     ) -> dict | None:
         """POST ``IPCWeightTransferUpdateInfo`` (names / dtype_names / shapes /
-        ipc_handles) to ``/update_weights``; record ``weight_version`` only on
-        success. ``ipc_handles`` are base64-cloudpickle'd (rebuild_fn closures).
+        ipc_handles) to ``/update_weights``; stage ``weight_version`` until
+        finish succeeds. ``ipc_handles`` contain base64-cloudpickle'd NPU rebuild arguments.
         """
         if self.node_rank != 0:
             return None
@@ -991,16 +992,13 @@ class VLLMEngine(RayActor):
         if flush_cache:
             self.flush_cache()
 
-        response = self._make_request(
-            "collective_rpc",
-            {"method": "update_weights_chunk", "kwargs": {"update_info": payload}},
-        )
+        response = self._post_vllm_update_weights_http(payload)
         if weight_version is not None:
-            self._weight_version = str(weight_version)
+            self._pending_weight_version = str(weight_version)
         return response
     
     def update_weights_chunk(self, update_info: dict) -> dict:
-        """POST ``/update_weights_chunk`` with a single named-tensor chunk.
+        """POST ``/update_weights`` with a single named-tensor chunk.
 
         Mirrors the SkyRL ``RemoteInferenceClient.update_weights_chunk`` API.
         Must be called between :meth:`start_weight_update` and
@@ -1011,7 +1009,7 @@ class VLLMEngine(RayActor):
         ``ipc_handles`` / ``ipc_handles_pickled`` for IPC, or ``packed`` for
         NCCL) — **not** wrapped in ``{"update_info": ...}``.
 
-        If ``ipc_handles`` are present (raw CUDA callables produced by
+        If ``ipc_handles`` are present (NPU rebuild arguments produced by
         ``reduce_tensor``), they are serialised with cloudpickle + base64 so
         vLLM can deserialise them when
         ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` is set.
@@ -1028,10 +1026,7 @@ class VLLMEngine(RayActor):
             payload["ipc_handles_pickled"] = base64.b64encode(cloudpickle.dumps(payload.pop("ipc_handles"))).decode(
                 "utf-8"
             )
-        response = self._make_request(
-            "collective_rpc",
-            {"method": "update_weights_chunk", "kwargs": {"update_info": payload}},
-        )
+        response = self._post_vllm_update_weights_http(payload)
         return response
 
     def flush_cache(self):
@@ -1109,12 +1104,8 @@ class VLLMEngine(RayActor):
     def release_memory_occupation(self, level: int = 1):
         """Flush prefix cache, then ``POST /sleep?level={level}``.
 
-        level=1 权重 park 到 host pinned(70G/引擎驻留);level=2 直接丢弃(仅
-        重映射空壳)。训推分时(共卡)场景用 level=2:权重随后必由 reload 会话
-        全量覆写,驻留纯属浪费(slime 09450c1b 语义)。历史上 level=2 的两个
-        障碍已消除:① wake 后 param 丢 weight_loader —— 由 _VLLMHijack 在
-        start_weight_update 重补丁;② wake 转置与 layerwise copy-back 冲突 ——
-        已按 LAYERWISE_INFO 门控跳过(vllm-ascend-023 560b39d6)。
+        Level 2 discards weights; vime_npu_ipc must complete a full reload
+        before KV wake and the next rollout.
         """
         if self.node_rank != 0:
             return None
@@ -1139,7 +1130,11 @@ class VLLMEngine(RayActor):
             params=wake_params,
             timeout=30,
         )
-        return _response_json(response)
+        result = _response_json(response)
+        self._awaiting_kv_wake = tags is not None and "kv_cache" not in tags
+        if not self._awaiting_kv_wake and self._resume_pending:
+            self.continue_generation()
+        return result
 
     def init_weight_transfer_engine(self, payload: dict) -> dict:
         """``POST /init_weight_transfer_engine`` with a caller-supplied payload (IPC path).
@@ -1161,24 +1156,21 @@ class VLLMEngine(RayActor):
                     time.sleep(2 * attempt)
         raise RuntimeError(f"vLLM init_weight_transfer_engine failed: {last_error}") from last_error
 
-    def start_weight_update(self, is_checkpoint_format: bool = False) -> dict:
-        """``POST /start_weight_update`` — signals vLLM to enter IPC weight-update mode."""
-        # [WSYNC-DBG 2026-07-14] 定位 2-engine "already active":打印本引擎身份 + 实际要 POST 的 http_base。
-        #   两条日志 http_base 相同但 rank 不同 → B 的 base 指到了 A 的端口(2-DP 端口分配 bug);
-        #   rank/base 两次完全相同 → _begin 列表里有重复句柄。ray 前缀里的 (VLLMEngine pid=) 即哪个引擎。
-        logger.info("[WSYNC-DBG] start_weight_update entry rank=%s node_rank=%s http_base=%s ckpt=%s",
-                    getattr(self, "rank", "?"), getattr(self, "node_rank", "?"),
-                    self._http_base(), is_checkpoint_format)
-        return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
+    def start_weight_update(self) -> dict:
+        """Start a native 0.28 update; the configured backend owns reload semantics."""
+        response = self._make_request("start_weight_update", {})
+        self._pending_weight_version = None
+        return response
 
-    def finish_weight_update(self) -> dict:
-        """``POST /finish_weight_update`` — signals vLLM to exit IPC weight-update mode.
-
-        Purely a state-machine bookend now; ``_weight_version`` is recorded by
-        ``update_weights_from_tensor`` (the IPC data-carrying RPC), matching slime's
-        single-RPC version-with-data semantics.
-        """
-        return self._make_request("finish_weight_update", {})
+    def finish_weight_update(self, weight_version: str | None = None) -> dict:
+        """Publish a version only after every worker finishes the entire update."""
+        version = str(weight_version) if weight_version is not None else self._pending_weight_version
+        payload = {"weight_version": version} if version is not None else {}
+        response = self._make_request("finish_weight_update", payload)
+        if self.node_rank == 0 and version is not None:
+            self._weight_version = version
+        self._pending_weight_version = None
+        return response
 
     def check_weights(self, action: str):
         """No vLLM ``weights_checker`` route; return a placeholder dict."""
@@ -1281,8 +1273,13 @@ class VLLMEngine(RayActor):
         logger.info("[WSYNC-DBG] continue_generation called node_rank=%s", self.node_rank)
         if self.node_rank != 0:
             return None
+        if self._awaiting_kv_wake:
+            # Weight sync finishes before the rollout manager wakes KV storage.
+            self._resume_pending = True
+            return None
         response = requests.post(f"{self._http_base()}/resume", json={}, timeout=120)
         response.raise_for_status()
+        self._resume_pending = False
         logger.info("[WSYNC-DBG] continue_generation POST /resume -> %s", response.status_code)
         return response
 

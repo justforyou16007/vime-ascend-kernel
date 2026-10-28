@@ -594,7 +594,7 @@ def test_weight_update_session_calls_start_and_finish(upw, monkeypatch):
     upw._end_vllm_weight_update_session(engines)
 
     assert len(engines[0].start_weight_update.calls) == 1
-    assert engines[0].start_weight_update.calls[0].kwargs["is_checkpoint_format"] is True
+    assert engines[0].start_weight_update.calls[0].kwargs == {}
     assert len(engines[1].start_weight_update.calls) == 1
     assert len(engines[0].finish_weight_update.calls) == 1
     assert len(engines[1].finish_weight_update.calls) == 1
