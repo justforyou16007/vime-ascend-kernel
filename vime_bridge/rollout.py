@@ -469,10 +469,14 @@ def fail_policy_update(args: Any, policy_version: int, reason: str | None = None
         return
     transition = _require_policy_transition(policy_version)
     transition_id = transition.transition_id
+    reason = reason or "VIME weight-update outcome is unknown"
+    # Polar limits reasons to 2000 characters; retain the exception and root cause.
+    if len(reason) > 2000:
+        reason = reason[:980] + "\n...[truncated]...\n" + reason[-1000:]
     payload = _post_policy_control(
         args,
         f"/rollout/admin/policy-transitions/{transition_id}/fail",
-        json_payload={"reason": reason or "VIME weight-update outcome is unknown"},
+        json_payload={"reason": reason},
         transition_id=transition_id,
     )
     if payload.get("phase") == "serving":

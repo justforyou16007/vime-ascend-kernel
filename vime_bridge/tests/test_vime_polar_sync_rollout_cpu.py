@@ -793,5 +793,28 @@ def test_latency_metrics_are_absent_when_no_group_completed():
     assert R._sync_group_latency_metrics([]) == {}
 
 
+@pytest.mark.parametrize("reason", [None, "", "x" * 2000, "RayTaskError: " + "栈" * 3000 + "NPU OOM"])
+def test_policy_failure_reason_fits_polar_limit(monkeypatch, reason):
+    transition = R._PolicyTransitionContext("update-test", "run-test", 0, 1, {})
+    monkeypatch.setattr(R, "_process_policy_transition", transition)
+    calls = []
+
+    def post(args, path, *, json_payload, transition_id):
+        sent = json_payload["reason"]
+        assert 0 < len(sent) <= 2000
+        if reason and len(reason) > 2000:
+            assert sent.startswith("RayTaskError:") and sent.endswith("NPU OOM")
+        else:
+            assert sent == (reason or "VIME weight-update outcome is unknown")
+        calls.append(path)
+        return dict(transition_id=transition_id, policy_namespace="run-test",
+                    from_epoch=0, to_epoch=1, kind="update", phase="recovery_required")
+
+    monkeypatch.setattr(R, "_post_policy_control", post)
+    R.fail_policy_update(_args(polar_policy_transition_enabled=True), 1, reason)
+    assert calls == ["/rollout/admin/policy-transitions/update-test/fail"]
+    assert R._process_policy_transition is transition
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-o", "addopts="]))
