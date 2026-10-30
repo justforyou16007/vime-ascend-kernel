@@ -171,7 +171,7 @@ class ServerState:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.url = f"http://{host}:{port}/v1"
+        self.url = f"http://{host}:{port}"
         self.client = httpx.AsyncClient(
             timeout=None,
             base_url=self.url,
@@ -967,13 +967,19 @@ async def _handle_completions(api: str, request: Request):
 @app.post("/v1/completions")
 @with_cancellation
 async def handle_completions(request: Request):
-    return await _handle_completions("/completions", request)
+    return await _handle_completions("/v1/completions", request)
 
 
 @app.post("/v1/chat/completions")
 @with_cancellation
 async def handle_chat_completions(request: Request):
-    return await _handle_completions("/chat/completions", request)
+    return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.post("/inference/v1/generate")
+@with_cancellation
+async def handle_generate(request: Request):
+    return await _handle_completions("/inference/v1/generate", request)
 
 
 @app.get("/healthcheck")

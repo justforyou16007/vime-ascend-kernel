@@ -583,6 +583,33 @@ def test_cancelled_forward_releases_live_load(proxy_state, monkeypatch):
     assert all(server.active_tokens == 0 for server in proxy_state.dp_servers)
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/completions", "/v1/chat/completions", "/inference/v1/generate"])
+def test_generation_routes_preserve_path_and_token_payload(proxy_state, monkeypatch, endpoint):
+    import httpx
+
+    payload = {"model": "test", "token_ids": [10, 20], "sampling_params": {"max_tokens": 4}}
+    output = {"choices": [{"token_ids": [30], "logprobs": {"content": [{"logprob": -0.2}]}}]}
+
+    async def forward(client, path, body, **kwargs):
+        request = client.build_request("POST", path, json=body)
+        assert request.url.path == endpoint
+        assert body == payload
+        return httpx.Response(200, json=output), None
+
+    monkeypatch.setattr(LB, "proxy_state", proxy_state)
+    monkeypatch.setattr(LB, "global_args", types.SimpleNamespace(max_retries=1, retry_delay=0), raising=False)
+    monkeypatch.setattr(LB, "_forward_upstream_with_retry", forward)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=LB.app), base_url="http://test") as client:
+            response = await client.post(endpoint, json=payload)
+            assert response.status_code == 200
+            assert response.json() == output
+
+    asyncio.run(exercise())
+    assert all(server.active_requests == 0 for server in proxy_state.dp_servers)
+
+
 def test_rollout_manager_clears_affinity_before_resuming_polar():
     """Lock the fail-closed ordering without importing Ray/NPU runtime dependencies."""
     tree = ast.parse((REPO_ROOT / "vime" / "ray" / "rollout.py").read_text())
