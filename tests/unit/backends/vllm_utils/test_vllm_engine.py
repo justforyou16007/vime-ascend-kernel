@@ -609,6 +609,16 @@ def test_colocated_launch_requires_reload_config(vllm_args):
     assert env["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
 
 
+def test_agent_parser_environment_reaches_vllm_serve(vllm_args, monkeypatch):
+    monkeypatch.setenv("VLLM_TOOL_CALL_PARSER", "qwen3_coder")
+    monkeypatch.setenv("VLLM_REASONING_PARSER", "qwen3")
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+    assert "--enable-auto-tool-choice" in cmd
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert cmd[cmd.index("--reasoning-parser") + 1] == "qwen3"
+
+
 @pytest.mark.parametrize("additional", [
     {"rl_config": {"enabled": False}}, {"weight_nz_mode": 1}, {"multistream_overlap_shared_expert": True},
 ])
