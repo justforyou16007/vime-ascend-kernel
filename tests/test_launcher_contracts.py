@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -374,3 +378,238 @@ def test_resource_layout_topology_fingerprint(
     roles = resolve_engine_roles(args)
     assert len(roles) == rollout // per_engine
     assert colocated_prefix_count(roles) == prefix
+
+
+# ─── Polar on a separate host (training Pod ⇄ Polar host ⇄ SSH ⇄ NPU VMs) ───
+
+
+def _polar_endpoint_block() -> str:
+    source = _source_text(RUNNER)
+    start = source.index("# ─── polar 数据 / 端点 ───")
+    end = source.index("\n", source.index("VLLM_ROUTER_PORT=", start))
+    return source[start:end]
+
+
+def _no_proxy_lines() -> str:
+    lines = [
+        line
+        for line in _source_text(RUNNER).splitlines()
+        if line.startswith(("export no_proxy=", "export NO_PROXY="))
+    ]
+    assert len(lines) == 2, lines
+    return "\n".join(lines)
+
+
+def _polar_preflight_function() -> str:
+    source = _source_text(RUNNER)
+    start = source.index("polar_preflight() {")
+    end = source.index("\n}\n", start) + 3
+    return source[start:end]
+
+
+def _clean_proxy_env(**overrides: str) -> dict[str, str]:
+    env = _shell_env()
+    for name in tuple(env):
+        if name.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"} or name.startswith("POLAR_"):
+            env.pop(name)
+    env.update(overrides)
+    return env
+
+
+def _resolve_polar_endpoint(**env_overrides: str) -> subprocess.CompletedProcess[str]:
+    script = f"""
+set -e
+MASTER_ADDR=80.48.5.56
+{_polar_endpoint_block()}
+printf 'url=%s\\n' "$POLAR_ROLLOUT_URL"
+printf 'host=%s\\n' "$POLAR_HOST"
+"""
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env=_clean_proxy_env(**env_overrides),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "url", "host"),
+    [
+        ({}, "http://80.48.5.56:8080", "80.48.5.56"),
+        ({"POLAR_HOST": "10.20.30.40", "POLAR_ROLLOUT_PORT": "8180"}, "http://10.20.30.40:8180", "10.20.30.40"),
+        ({"POLAR_ROLLOUT_URL": "http://polar-box.local:9000/"}, "http://polar-box.local:9000", "polar-box.local"),
+        ({"POLAR_HOST": "1.1.1.1", "POLAR_ROLLOUT_URL": "http://10.0.0.9:8180"}, "http://10.0.0.9:8180", "10.0.0.9"),
+    ],
+)
+def test_polar_endpoint_can_live_on_a_separate_host(overrides: dict[str, str], url: str, host: str) -> None:
+    result = _resolve_polar_endpoint(**overrides)
+    assert result.returncode == 0, result.stderr
+    fields = _stdout_fields(result)
+    assert fields["url"] == url
+    assert fields["host"] == host
+
+
+@pytest.mark.parametrize("bad_url", ["10.0.0.9:8180", "http://10.0.0.9:80x", "ftp://10.0.0.9:21"])
+def test_polar_endpoint_rejects_malformed_url(bad_url: str) -> None:
+    result = _resolve_polar_endpoint(POLAR_ROLLOUT_URL=bad_url)
+    assert result.returncode != 0
+    assert "POLAR_ROLLOUT_URL must look like" in result.stderr
+
+
+def test_polar_host_reaches_no_proxy_before_ray_starts() -> None:
+    source = _source_text(RUNNER)
+    resolved = source.index("POLAR_HOST=$(python3")
+    exported = source.index("export no_proxy=")
+    # Both raylets (head and worker) must inherit the Polar no_proxy entry.
+    assert resolved < exported < source.index("ray start --head") < source.index("ray start --address")
+    assert "${POLAR_HOST}" in source[exported : source.index("\n", exported)]
+
+
+def test_polar_preflight_runs_on_head_before_ray_teardown_only() -> None:
+    source = _source_text(RUNNER)
+    head = source.index('if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then')
+    worker = source.index("\nelse\n   # worker", head)
+    assert head < source.index("   polar_preflight\n", head) < source.index("ray stop --force", head) < worker
+    assert "polar_preflight" not in source[worker:]
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+        status = 200 if self.path == "/health" else 404
+        body = b'{"status":"ok"}' if status == 200 else b"missing"
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - base signature
+        pass  # keep pytest output free of per-request access logs
+
+
+def _serve_health(host: str) -> ThreadingHTTPServer:
+    try:
+        server = ThreadingHTTPServer((host, 0), _HealthHandler)
+    except OSError as exc:
+        pytest.skip(f"cannot bind {host}: {exc}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_launcher_polar_path(**env_overrides: str) -> subprocess.CompletedProcess[str]:
+    """Endpoint resolution + the real no_proxy export + preflight, as the head runs them."""
+    script = f"""
+set -e
+MASTER_ADDR=80.48.5.56
+CURRENT_IP=80.48.5.56
+ROLLOUT_NODE_IP=80.48.5.64
+VLLM_ROUTER_IP=80.48.5.56
+{_polar_endpoint_block()}
+{_no_proxy_lines()}
+{_polar_preflight_function()}
+polar_preflight
+printf 'after_preflight=1\\n'
+"""
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env=_clean_proxy_env(POLAR_PREFLIGHT_WAIT="0", **env_overrides),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_remote_polar_bypasses_http_proxy_and_passes_preflight() -> None:
+    # 127.0.0.2 is outside the launcher's fixed no_proxy entries, so the probe only
+    # avoids the dead proxy if the launcher really appended the Polar host.
+    server = _serve_health("127.0.0.2")
+    dead_proxy = f"http://127.0.0.1:{_unused_port()}"
+    try:
+        result = _run_launcher_polar_path(
+            POLAR_ROLLOUT_URL=f"http://127.0.0.2:{server.server_address[1]}",
+            http_proxy=dead_proxy,
+            HTTP_PROXY=dead_proxy,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == 0, result.stderr
+    assert "[polar] preflight OK" in result.stdout
+    assert "sglang_router_url must be http://80.48.5.56:8001" in result.stdout
+    assert _stdout_fields(result)["after_preflight"] == "1"
+
+
+def test_polar_preflight_fails_fast_when_polar_is_unreachable() -> None:
+    result = _run_launcher_polar_path(POLAR_ROLLOUT_URL=f"http://127.0.0.1:{_unused_port()}")
+    assert result.returncode != 0
+    assert "cannot reach the Polar rollout server" in result.stderr
+    assert "after_preflight" not in result.stdout
+
+
+def test_polar_preflight_rejects_a_non_success_health_status() -> None:
+    server = _serve_health("127.0.0.1")
+    try:
+        result = _run_launcher_polar_path(
+            POLAR_ROLLOUT_URL=f"http://127.0.0.1:{server.server_address[1]}/missing-prefix"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode != 0
+    assert "HTTP 404" in result.stderr
+
+
+def test_polar_preflight_can_be_skipped() -> None:
+    result = _run_launcher_polar_path(
+        POLAR_ROLLOUT_URL=f"http://127.0.0.1:{_unused_port()}",
+        POLAR_PREFLIGHT="0",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "preflight skipped" in result.stdout
+
+
+def _run_sync_hybrid_with_stub_runner(tmp_path: Path, **env_overrides: str) -> subprocess.CompletedProcess[str]:
+    """Execute start_sync_hybrid.sh but replace the nested `bash <runner>` with a recorder."""
+    real_bash = shutil.which("bash")
+    assert real_bash is not None
+    stub = tmp_path / "bash"
+    stub.write_text('#!/bin/sh\nprintf "runner=%s\\n" "$*"\nprintf "url=%s\\n" "$POLAR_ROLLOUT_URL"\n')
+    stub.chmod(0o755)
+    env = _clean_proxy_env(**env_overrides)
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    return subprocess.run(
+        [real_bash, str(SYNC_HYBRID)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_sync_hybrid_requires_explicit_polar_host(tmp_path: Path) -> None:
+    missing = _run_sync_hybrid_with_stub_runner(tmp_path)
+    assert missing.returncode != 0
+    assert "POLAR_HOST" in missing.stderr
+    assert "runner=" not in missing.stdout
+
+    given = _run_sync_hybrid_with_stub_runner(tmp_path, POLAR_HOST="10.20.30.40")
+    assert given.returncode == 0, given.stderr
+    fields = _stdout_fields(given)
+    assert fields["runner"] == "scripts/run-qwen36-35b-polar-multi-pd.sh"
+    assert fields["url"] == "http://10.20.30.40:8180"
+
+
+def test_hybrid_layout_reserves_no_training_npu_for_remote_polar() -> None:
+    layout = load_resource_layout(REPO_ROOT / "scripts" / "resource_layout.hybrid56cola64infer.yaml")
+    assert layout.polar_reserved == ()

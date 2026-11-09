@@ -7,8 +7,9 @@ deploy it alongside the vime training image.
 
 - package: `polar` (pure Python; `src/{polar, ascend_operator, slime_bridge}`)
 - role: drives task rollouts and bridges to the vime trainer via `slime_bridge`
-  (weight sync, task request/response); co-located with training (reserves a
-  slice of NPUs via `polar_reserved`).
+  (weight sync, task request/response); either co-located with training (reserves a
+  slice of NPUs via `polar_reserved`) or deployed on a separate host that drives a
+  fixed pool of NPU VMs over SSH (see `../RUNBOOK.md` §13).
 - runs each task inside the **sandbox** image (`ascendc-tilelang`, see
   `../sandbox/`).
 

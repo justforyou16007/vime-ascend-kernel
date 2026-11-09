@@ -12,10 +12,18 @@
 #   * FEAT_SYNC_ROLLOUT=1:使用 one-shot sync rollout。runner 默认仍为 async/session_pool，
 #     这样其他启动入口不会改变；本脚本明确选择 train.py + sync + durable 组合。
 #
-# 前置(.64 手工):
-#   1) polar 推理端点 → http://80.48.5.56:8011;
-#   2) polar 卡池 "0-15" 改为 "0-7"(或按实际剩余);
-#   3) .64 先跑 start_pd_worker.sh 加入 Ray(同 pd 流程);老的分离部署进程先清干净。
+# Polar 部署(独立部署机):
+#   拓扑:训练 Pod(.56 head + .64 worker)⇄ Polar 部署机 ⇄ SSH ⇄ 固定 16 台 NPU 虚拟机。
+#   训练端只主动访问 Polar rollout server,地址由 POLAR_HOST(必填)和 POLAR_ROLLOUT_PORT(默认 8180)给出:
+#     POLAR_HOST=<polar 部署机 IP> bash scripts/start_sync_hybrid.sh
+#   launcher 会把该主机自动加进 no_proxy,并在拆 Ray、加载模型前先探 /health,不通立即退出。
+# 前置(Polar 部署机,手工):
+#   1) Polar rollout server 监听 0.0.0.0:8180,训练 Pod 能直连;
+#   2) profile 推理端点(sglang_router_url)→ http://80.48.5.56:8011。RolloutManager 在 rollout
+#      首个 bundle(.56 共卡段),LB proxy 跟着起在 .56;Polar 进程的 no_proxy 要包含 80.48.5.56;
+#   3) 算子编译/评测不再占训练节点的 NPU:Polar 改用 16 台虚拟机池(SSH 执行,任务之间重置工作区,
+#      虚拟机复用、不删除也不重建)。布局里 .64 0-7 因此不再给 Polar 预留,目前空闲。
+# 前置(.64 手工):先跑 start_pd_worker.sh 加入 Ray(同 pd 流程);老的分离部署进程先清干净。
 #
 # 内存账(61G/卡,按引擎分叉:共卡 VLLM_GPU_MEM_UTIL=0.70,专用 DEDICATED=0.85):
 #   共卡 .56(引擎 + trainer 同卡,run 203413 实测):
@@ -62,7 +70,7 @@ PP=2 \
 POLAR_TRAJECTORY_PG_FLOOR=0.05 \
 POLAR_ATTEMPT_W=0.1 \
 POLAR_T3A_MASK_MAIN_CHAIN=0 \
-POLAR_ROLLOUT_URL=http://80.48.5.64:8180 \
+POLAR_ROLLOUT_URL=http://${POLAR_HOST:?missing Polar host, run as POLAR_HOST=polar-host-ip bash scripts/start_sync_hybrid.sh}:${POLAR_ROLLOUT_PORT:-8180} \
 FEAT_SYNC_ROLLOUT=1 \
 POLAR_SYNC_OVERSUBSCRIBE_FACTOR=1.0 \
 POLAR_POLICY_TRANSITION_ENABLED=1 \

@@ -8,7 +8,8 @@ vLLM/vllm-ascend 推理(不是 SGLang)**,并有一批 NPU 专属环境变量。
 
 - **vime 训练容器**负责 Ray、Megatron 训练、**vLLM 推理**、样本数据集读取。
 - **Polar 仓库放在宿主机**,负责 rollout/gateway/observer/watcher,以及启动 agent
-  runtime 子容器(即 sandbox 镜像)。
+  runtime 子容器(即 sandbox 镜像)。也可以独立部署在第三台机器,经 SSH 使用 NPU
+  虚拟机池,见 §13。
 - vime 只需要知道 Polar rollout URL、数据集路径、resource layout。
 - 运行产物:vime 侧写到 `output/polar_bridge/`;polar 侧写到仓内
   `output/ascend_operator/`。
@@ -352,7 +353,8 @@ tail -f .../output/ascend_operator/runs/${POLAR_RUN_ID}/logs/gateway.log
 - `source /usr/local/Ascend/nnal/atb/set_env.sh` —— 除 CANN set_env 外还要 source atb。
 
 **代理**:Polar health 返回代理 HTML 或 504 → 检查 `NO_PROXY/no_proxy` 是否绕过
-train-host/infer-host。
+train-host/infer-host。训练端 launcher 会自动把 `POLAR_ROLLOUT_URL` 的主机加进 no_proxy;
+Polar 进程那一侧的 no_proxy 仍需手工包含训练节点。
 
 **网卡**:Gloo 报找不到网卡 → 容器内 `ip -o -4 addr show` 查真实网卡名,设
 `SOCKET_IFNAME=<真实网卡名>`。
@@ -363,3 +365,78 @@ train-host/infer-host。
 **短 debug run 尾部 session 异常落盘**:session_pool 预取导致的收尾现象;训练侧只消费
 `NUM_ROLLOUT * ROLLOUT_BATCH_SIZE` 个 group,prefix merge 后训练 sample 数可能大于原始
 session 数,正常。长稳训练不会表现成这个问题。
+
+---
+
+## 13. Polar 独立部署(第三台机器 + SSH NPU 虚拟机池)
+
+拓扑与每条链路的方向:
+
+```
+训练 Pod(Ray head .56 + worker .64)
+   │ ① 训练 → Polar  POLAR_ROLLOUT_URL(hybrid 入口默认端口 8180)
+   │                 任务提交/轮询 + 暂停/恢复/权重版本/策略切换等全部控制请求
+   │ ② Polar → 训练  sglang_router_url = http://<RolloutManager 节点>:8011(LB proxy,推理)
+Polar 部署机(rollout server / gateway / observer)
+   │ ③ SSH
+固定 16 台 NPU 虚拟机(算子编译、评测;任务之间重置工作区,虚拟机复用、不删除不重建)
+```
+
+**训练端(本仓库)已处理:**
+
+- 地址:`POLAR_ROLLOUT_URL` > `http://${POLAR_HOST}:${POLAR_ROLLOUT_PORT}` > `http://${MASTER_ADDR}:8080`
+  (最后一项是旧的同机默认)。`scripts/start_sync_hybrid.sh` 要求必须给出 `POLAR_HOST`。
+- 代理:launcher 把 Polar 主机自动加入 `no_proxy`/`NO_PROXY`,并且在 `ray start` 之前完成,
+  所以所有 Ray 进程都会继承。否则训练端访问新机器的请求会被转到公司代理,表现为代理 HTML 或 504。
+- 预检:head 在拆 Ray、加载模型之前请求 `${POLAR_ROLLOUT_URL}/health`,不通几秒内就退出。
+  `POLAR_PREFLIGHT=0` 跳过,`POLAR_PREFLIGHT_WAIT` 设置最长等待秒数(默认 60)。
+- 卡位:`resource_layout.hybrid56cola64infer.yaml` 不再给 Polar 声明 `polar_reserved`,
+  `.64` 的 0-7 目前空闲。把它们用于推理需要同时改 `ROLLOUT_NUM_GPUS` 和权重广播规模,要另行验证。
+- 两边没有共享目录:算子源码由训练端读本地 `OPERATOR_TASKS_DIR` 后放进请求体
+  (`task_source` + sha256),轨迹随 HTTP 响应返回;`result_paths` 只做计数和日志,不会去读。
+
+**网络放通:**
+
+| 方向 | 用途 | 端口 |
+|---|---|---|
+| 训练 Pod → Polar 部署机 | rollout server(①) | 8180(或 `POLAR_ROLLOUT_PORT`) |
+| Polar 部署机 → 训练 Pod 的 RolloutManager 节点(hybrid = .56) | LB proxy(②) | `VLLM_ROUTER_PORT`(8011) |
+| Polar 部署机 → NPU 虚拟机 | SSH(③) | 22 |
+
+**Polar 部署机侧(Polar 仓 ProRL-Agent-Server,不在本仓库):**
+
+1. profile:`service.bind_host: 0.0.0.0`;`rollout_url`、`gateway_url` 写 Polar 部署机自己的 IP;
+   `sglang_router_url` 写 `http://<RolloutManager 节点 IP>:8011`(hybrid 布局为 `http://80.48.5.56:8011`)。
+2. Polar 进程的 `NO_PROXY`/`no_proxy` 要包含训练节点 IP。
+3. 把"本机 Docker 子容器 + `npu_pool` 卡池"换成 16 台虚拟机池:每次评测租用一台,经 SSH 执行;
+   归还前重置工作区——删除上一个任务的目录、结束残留进程,并确认 NPU 已空闲,
+   防止上一个任务的残留影响下一个任务的评测结果。虚拟机本身复用,不重建。
+4. 如果 agent(Claude Code CLI)在虚拟机上运行,它需要访问 Polar gateway,但拓扑里只有
+   Polar → 虚拟机方向的 SSH,可以用 `ssh -R` 把 gateway 端口反向转发到虚拟机上;
+   如果 agent 在 Polar 部署机上运行、只把编译和评测命令下发到虚拟机,就不需要这一步。
+5. `POLAR_KEEP_SESSION_DIR`、`POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS` 这类 Polar 自己的环境变量
+   要在 Polar 部署机上设置;训练 launcher 里的 export 对远端 Polar 不起作用。
+
+**启动顺序:**
+
+```
+# 1) Polar 部署机:按 §5 启动 Polar,本机先确认
+curl -s http://127.0.0.1:8180/health
+
+# 2) .64:加入 Ray(同 start_pd_worker.sh 流程)
+
+# 3) .56(训练 Pod head):
+POLAR_HOST=<polar 部署机 IP> bash scripts/start_sync_hybrid.sh
+#    日志出现 "[polar] preflight OK" 才会继续拉起 Ray 和模型
+
+# 4) 引擎起来之后,在 Polar 部署机上验证反向链路:
+curl -s http://80.48.5.56:8011/health
+```
+
+**已知限制:**
+
+- `rl_dashboard.py` 的 Polar session 面板读本机目录(默认 `/home/docker/polar_can/...`)。
+  Polar 远端部署后,需要在 Polar 部署机上运行面板,或把该目录挂载过来再用 `--polar` 指定。
+- `task_request` 提交模式(SWE 脚本)的结果回调地址 `polar_callback_host` 默认是 `127.0.0.1`,
+  远端 Polar 回调不到,会退化为每 60 秒轮询一次结果(变慢但不会卡住)。
+  本入口用的 `operator_samples` 模式本来就靠轮询,不受影响。

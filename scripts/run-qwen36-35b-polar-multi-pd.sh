@@ -6,11 +6,12 @@
 # layout 的 actor、rollout、polar_reserved 和 num_gpus_per_engine 会在启动时校验；
 # 共卡布局中的 share: actor 段必须排在专用段之前。
 #
-# 前置:宿主机(.56)先起 polar,且 profile 里
+# 前置:先起 polar(同机部署在宿主机;独立部署在第三台机器,用 POLAR_HOST 或
+#   POLAR_ROLLOUT_URL 指过去,head 启动时会先探活),且 profile 里
 #   sglang_router_url: http://80.48.5.64:8001    ← proxy 起在 **rollout 节点**,不是 head。
 #     原因:layout 路径下 create_rollout_manager(placement_group.py:317)把 RolloutManager 钉在
 #     rollout 首个 bundle → 它进程内起的 PD proxy 也就落在 .64。
-#   npu_pool: "8,9,10,11,12,13,14,15"            ← 避开 actor 的 0-7
+#   npu_pool: "8,9,10,11,12,13,14,15"            ← 仅同机部署需要:避开 actor 的 0-7
 #
 # 启动(两台跑同一个脚本,靠 CURRENT_IP==MASTER_ADDR 分角色;NPUS_PER_NODE/可见卡按角色自动填)。
 #
@@ -136,6 +137,33 @@ POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
 OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
 OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
+
+# Polar 可与训练同机,也可独立部署在第三台机器(训练 Pod ⇄ Polar 部署机 ⇄ SSH ⇄ NPU 虚拟机)。
+# 训练端主动访问的只有 Polar rollout server 这一个地址:任务提交/轮询,以及暂停/恢复/
+# 权重版本/策略切换等全部控制请求(网关相关的由 rollout server 代为转发)。算子源码由训练端
+# 读本地 OPERATOR_TASKS_DIR 后放进请求体发送,结果随 HTTP 响应返回,两边不需要共享目录。
+# 地址优先级:POLAR_ROLLOUT_URL > http://POLAR_HOST:POLAR_ROLLOUT_PORT > http://MASTER_ADDR:8080(旧的同机默认)。
+POLAR_ROLLOUT_PORT=${POLAR_ROLLOUT_PORT:-8080}
+POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${POLAR_HOST:-${MASTER_ADDR}}:${POLAR_ROLLOUT_PORT}}
+POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL%/}
+# 从 URL 取出主机名,下面会把它加进 no_proxy。必须在 ray start 之前定好:Ray 进程继承
+# 这里的环境变量;Polar 主机不在 no_proxy 里时,训练端访问它的请求会被转到公司代理上。
+POLAR_HOST=$(python3 - "${POLAR_ROLLOUT_URL}" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+url = sys.argv[1]
+try:
+    parts = urlsplit(url)
+    scheme, host = parts.scheme, parts.hostname
+    parts.port  # a malformed port raises ValueError here
+except ValueError:
+    scheme, host = None, None
+if scheme not in {"http", "https"} or not host:
+    raise SystemExit(f"[launcher][FATAL] POLAR_ROLLOUT_URL must look like http://<host>:<port>, got {url!r}")
+print(host)
+PY
+)
 VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # polar profile 的推理端点指向它
 # PD proxy bind 在 RolloutManager 所在节点 = rollout 节点(见文件头说明),不是 head。
 VLLM_ROUTER_IP=${VLLM_ROUTER_IP:-${ROLLOUT_NODE_IP}}
@@ -203,6 +231,8 @@ export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}     # 禁 IP 白名�
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export HCCL_INTER_HCCS_DISABLE=${HCCL_INTER_HCCS_DISABLE:-true}
+# POLAR_KEEP_SESSION_DIR / POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS 只由 Polar 进程读取，训练端代码不读。
+# Polar 独立部署时，要在 Polar 部署机启动 Polar 的环境里设置，这里 export 对它不生效。
 export POLAR_KEEP_SESSION_DIR=${POLAR_KEEP_SESSION_DIR:-1}
 export POLAR_TRAJECTORY_PG_STRICT=${POLAR_TRAJECTORY_PG_STRICT:-1}
 export POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS=${POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS:-12288}
@@ -216,7 +246,7 @@ if [ -n "${SOCKET_IFNAME}" ]; then
    CURRENT_IP=${CURRENT_IP:-$(ifconfig "${SOCKET_IFNAME}" 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')}
 fi
 CURRENT_IP=${CURRENT_IP:-$(hostname -I | awk '{print $1}')}
-export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP},${ROLLOUT_NODE_IP}${no_proxy:+,${no_proxy}}"
+export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP},${ROLLOUT_NODE_IP},${POLAR_HOST}${no_proxy:+,${no_proxy}}"
 export NO_PROXY="${no_proxy}"
 if [ -z "${SOCKET_IFNAME}" ]; then
    SOCKET_IFNAME=$(ip -o addr show 2>/dev/null | awk -v t="${CURRENT_IP}" '{split($4,p,"/"); if (p[1]==t){print $2; exit}}')
@@ -244,9 +274,8 @@ else
    export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 fi
 echo "[topo] role=${NODE_ROLE} ip=${CURRENT_IP} if=${SOCKET_IFNAME} npus=${NPUS_PER_NODE} devices=${ASCEND_RT_VISIBLE_DEVICES}"
-echo "[topo] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}卡@${MASTER_ADDR} rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP} per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE} proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
+echo "[topo] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}卡@${MASTER_ADDR} rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP} per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE} proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT} polar=${POLAR_ROLLOUT_URL}"
 
-POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
 LOG_FILE=${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}
 if [[ "${LOG_FILE}" != /* ]]; then
    LOG_FILE="${VIME_ROOT}/${LOG_FILE}"
@@ -268,6 +297,50 @@ publish_observer_log_pointer() {
    printf '%s\n' "${LOG_FILE}" > "${pointer_tmp}"
    mv -f -- "${pointer_tmp}" "${pointer}"
    echo "[observer] bound ${pointer} -> ${LOG_FILE}"
+}
+
+# ─── Polar 连通性预检(只在 head 执行)───
+# Polar 搬到独立部署机后,训练端到 Polar 的网络(地址、端口、防火墙、代理)成了新的故障点。
+# 训练端第一次真正访问 Polar 是在引擎全部起来之后(bootstrap 控制请求),那时模型已加载完;
+# 这里在拆 Ray、加载模型之前先探一次 /health,让配置错误几秒内暴露。
+# 探测沿用当前进程的 http_proxy/no_proxy 环境变量,与训练进程访问 Polar 时的条件一致。
+# POLAR_PREFLIGHT=0 跳过;POLAR_PREFLIGHT_WAIT 为最长等待秒数(默认 60,容忍 Polar 正在启动)。
+polar_preflight() {
+   if [ "${POLAR_PREFLIGHT:-1}" != "1" ]; then
+      echo "[polar] preflight skipped (POLAR_PREFLIGHT=${POLAR_PREFLIGHT})"
+      return 0
+   fi
+   python3 - "${POLAR_ROLLOUT_URL}" "${POLAR_PREFLIGHT_WAIT:-60}" <<'PY'
+import sys
+import time
+import urllib.error
+import urllib.request
+
+url = sys.argv[1].rstrip("/") + "/health"
+deadline = time.monotonic() + max(float(sys.argv[2]), 0.0)
+last_error = "no attempt"
+while True:
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            print(f"[polar] preflight OK: {url} -> HTTP {response.status}")
+            raise SystemExit(0)
+    except urllib.error.HTTPError as exc:
+        last_error = f"HTTP {exc.code}: {exc.read(200)!r}"
+    except OSError as exc:  # refused / timeout / DNS; URLError is an OSError
+        last_error = f"{type(exc).__name__}: {exc}"
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(5)
+raise SystemExit(
+    f"[polar][FATAL] training side cannot reach the Polar rollout server: {url} ({last_error})\n"
+    "  check: Polar is running on its host and bound to 0.0.0.0; the port is open from this node;\n"
+    "  the host is in no_proxy (the launcher adds the POLAR_ROLLOUT_URL host automatically).\n"
+    "  set POLAR_PREFLIGHT=0 to skip this check."
+)
+PY
+   # 反方向(Polar → 训练端 LB proxy)只能在 Polar 机器上验证:proxy 要等引擎起来才监听。
+   echo "[polar] reverse path: Polar profile sglang_router_url must be http://${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}" \
+        "(check from the Polar host after engines are up: curl http://${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}/health)"
 }
 
 # ─── 参数分组 ───
@@ -643,6 +716,7 @@ cleanup_rollout_residue() {
 
 # ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
+   polar_preflight
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
    cleanup_rollout_residue

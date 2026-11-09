@@ -3,7 +3,10 @@
 # 拓扑(混合更新器:本机 IPC + 跨机 HCCL,2026-08-21 起):
 #   .56  16 卡  训练 + 4 个 TP4 引擎(共卡分时,训练窗口 sleep)
 #   .64  8 卡   2 个 TP4 引擎,纯推理(needs_offload=False,常驻不 sleep)
-#   .64  0-3    polar 算子评测池(不进 Ray)
+#   .64  0-7    空闲。Polar 已移到独立部署机,算子评测走它 SSH 管理的 16 台 NPU 虚拟机,
+#               不再占训练节点的卡,所以这里不声明 polar_reserved。
+#               (不影响建组:.64 的 bundle 本来就按最大卡号 15 从 0 补齐,见 placement_group.py。)
+#               若要把 0-7 也用于推理,需要同时改 ROLLOUT_NUM_GPUS 和 HCCL 广播规模,另行验证。
 #
 # 权重同步(UpdateWeightFromTensor 混合模式,slime 同款):
 #   .56 共卡引擎走 NPU IPC 直传,不进 HCCL 域 → HCCL "同域不同卡" 约束天然规避,
@@ -18,8 +21,6 @@ roles:
     - {node: 80.48.5.56, devices: "0-7", share: actor}     # 4 台共卡引擎(HCCS 域 A)
     - {node: 80.48.5.56, devices: "8-15", share: actor}    # 4 台共卡引擎(HCCS 域 B)
     - {node: 80.48.5.64, devices: "8-15"}                  # 2 台专用引擎,常驻
-  polar_reserved:
-    - {node: 80.48.5.64, devices: "0-7"}
 rollout:
   num_gpus_per_engine: 4                 # 共 6 个 TP4 引擎(4 共卡 + 2 专用)
   # vllm_dp_size: 6                    # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数
